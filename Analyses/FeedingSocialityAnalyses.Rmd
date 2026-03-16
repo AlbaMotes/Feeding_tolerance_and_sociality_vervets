@@ -1,0 +1,245 @@
+---
+title: "FeedingSocialTolerance"
+author: "Alba Motes Rodrigo"
+date: "2026-03-05"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(lubridate)
+library(igraph)
+```
+
+
+```{r}
+#load dates of carpet experiments
+carpet_dates<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/FeedingSocialityProject/carpet_dates.csv")
+#load scans
+scans<-read.csv("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/IVP_data/scans/scanswithid_ivp_filtered.csv")
+```
+
+```{r}
+scans <- scans %>%
+  mutate(
+    month_day   = as.numeric(format(as.Date(date), "%m%d")),
+    season      = ifelse(month_day >= 515 & month_day <= 1115, "wet", "dry"),
+    season_id   = case_when(
+      month_day >= 515 & month_day <= 1115 ~ paste("wet", year, sep = "_"),
+      month_day > 1115 ~ paste("dry", year, sep = "_"),
+      month_day < 515  ~ paste("dry", year - 1, sep = "_")
+    )
+  ) %>%
+  dplyr::select(-month_day)
+```
+
+```{r}
+#calculate edgelist with custom function
+source("/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/FeedingSocialityProject/Anlyses/functions/create_edglistarm1m_fromscans.R")
+edgelist_scans <- create_scan_edgelist(scans)
+#Remove cases where one dyad member did not appear in any scan of that group that year
+edgelist_scans <- edgelist_scans %>% filter(!is.na(scans_individual_a) & !is.na(scans_individual_b))
+```
+
+#Function to calcualte individual network metrics from the edgelist of 1m and arm length scans
+individual_strength = sum(co_occurrence_scans per dyad) / scans_sampled
+scans_sampled = number of scans in which that individual appears
+co_occurrence = number of scans where both individuals appear
+```{r}
+calculate_network_metrics <- function(data, grp,  ssn) {
+  
+  subset <- data %>% filter(group == grp, season_id == ssn)
+  
+  if (nrow(subset) == 0) return(NULL)
+  
+  # Build weighted graph
+  g <- graph_from_data_frame(
+    subset %>% dplyr::select(individual_a, individual_b, weight = association_rate),
+    directed = FALSE
+  )
+  
+  # Reshape to long format so each individual appears once per dyad
+  individual_dyads <- bind_rows(
+    subset %>% dplyr::select(individual = individual_a, partner = individual_b,
+                      co_occurrence_scans, association_rate, scans_sampled = scans_individual_a),
+    subset %>% dplyr::select(individual = individual_b, partner = individual_a,
+                      co_occurrence_scans, association_rate, scans_sampled = scans_individual_b)
+  )
+  
+  # Individual-level stats
+  individual_stats <- individual_dyads %>%
+    group_by(individual) %>%
+    summarise(
+      scans_sampled = unique(scans_sampled),
+      degree        = n(),
+      strength      = sum(association_rate),
+      .groups = "drop"
+    )
+  
+  # Graph-based metrics
+  graph_metrics <- data.frame(
+    individual  = V(g)$name,
+    betweenness = betweenness(g, weights = 1/E(g)$weight, normalized = TRUE),
+    eigenvector = eigen_centrality(g, weights = E(g)$weight)$vector
+  )
+  
+  # Combine
+  individual_metrics <- individual_stats %>%
+    left_join(graph_metrics, by = "individual") %>%
+    mutate(group = grp, season_id = ssn)
+  
+  # Group-level metrics
+  group_metrics <- data.frame(
+    group            = grp,
+    season_id           = ssn,
+    n_individuals    = vcount(g),
+    n_dyads          = ecount(g),
+    total_dyad_scans = sum(subset$total_dyad_scans),
+    density          = edge_density(g),
+    mean_strength    = mean(strength(g, weights = E(g)$weight)),
+    clustering_coef  = transitivity(g, type = "global")
+  )
+  
+  return(list(individual = individual_metrics, group = group_metrics))
+}
+
+# Apply across all group-year-season combinations
+combinations <- edgelist_scans %>%
+  distinct(group, season_id)
+
+all_individual <- list()
+all_group      <- list()
+
+for (i in seq_len(nrow(combinations))) {
+  result <- calculate_network_metrics(
+    edgelist_scans,
+    combinations$group[i],
+    combinations$season_id[i]
+  )
+  if (!is.null(result)) {
+    all_individual <- append(all_individual, list(result$individual))
+    all_group      <- append(all_group, list(result$group))
+  }
+}
+individual_metrics_df <- bind_rows(all_individual)
+group_metrics_df      <- bind_rows(all_group)
+
+```
+
+#subset periods with carpet
+```{r}
+individual_metrics_filtered <- individual_metrics_df %>%
+  filter(group %in% c("Ankhase", "Noha"),
+         season_id %in% c("dry_2024", "wet_2025", "dry_2025", "wet_2026"))
+
+group_metrics_filtered <- group_metrics_df %>%
+  filter(group %in% c("Ankhase", "Noha"),
+         season_id %in% c("dry_2024", "wet_2025", "dry_2025", "wet_2026"))
+```
+
+#normalise degree
+```{r}
+group_size <- data.frame(
+  group     = c("Ankhase", "Ankhase", "Ankhase","Ankhase", "Noha",     "Noha",     "Noha", "Noha"),
+  season_id = c("dry_2024", "wet_2025", "dry_2025", "wet_2026", "dry_2024", "wet_2025", "dry_2025", "wet_2026"),
+  group_size = c(16, 15, 15, 16, 22, 21, 21, 20)
+)
+
+individual_metrics_filtered <- individual_metrics_filtered %>%
+  left_join(group_size, by = c("group", "season_id")) %>%
+  mutate(degree_normalized = degree / (group_size - 1)) 
+```
+
+#descriptives number of scans in which individuals were observed
+```{r}
+tapply(individual_metrics_filtered$scans_sampled, 
+       individual_metrics_filtered$season_id, 
+       summary)
+```
+$dry_2024
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+    1.0     3.0     5.0     6.3     9.0    16.0 
+
+$wet_2025
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+   1.00   19.25   27.50   27.47   34.75   52.00 
+
+$dry_2025
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+   1.00   18.00   27.00   27.27   36.00   59.00 
+
+$wet_2026
+NULL
+
+#Plot
+```{r}
+library(ggplot2)
+library(tidyr)
+
+# Order seasons chronologically
+season_order <- c("dry_2024", "wet_2025", "dry_2025", "wet_2026")
+
+individual_metrics_filtered <- individual_metrics_filtered %>%
+  mutate(season_id = factor(season_id, levels = season_order))
+
+group_metrics_filtered <- group_metrics_filtered %>%
+  mutate(season_id = factor(season_id, levels = season_order))
+
+# --- Individual metrics: boxplots per season and group ---
+individual_long <- individual_metrics_filtered %>%
+  pivot_longer(cols = c(strength, degree_normalized, betweenness, eigenvector),
+               names_to = "metric", values_to = "value")
+
+ggplot(individual_long, aes(x = season_id, y = value, fill = group)) +
+  geom_jitter(aes(color = group), position = position_jitterdodge(jitter.width = 0.2),
+              size = 1, alpha = 0.4) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_manual(values = c("Ankhase" = "#E69F00", "Noha" = "#56B4E9")) +
+  scale_color_manual(values = c("Ankhase" = "#E69F00", "Noha" = "#56B4E9")) +
+  labs(x = "Season", y = "Value", fill = "Group", color = "Group",
+       title = "Individual social network metrics per season") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  expand_limits(y = 0)
+
+# --- Group metrics: line plot per season ---
+group_long <- group_metrics_filtered %>%
+  pivot_longer(cols = c(density, mean_strength, clustering_coef),
+               names_to = "metric", values_to = "value")
+
+ggplot(group_long, aes(x = season_id, y = value, color = group, group = group)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_color_manual(values = c("Ankhase" = "#E69F00", "Noha" = "#56B4E9")) +
+  labs(x = "Season", y = "Value", color = "Group",
+       title = "Group social network metrics per season") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  expand_limits(y = 0)
+
+group_metrics_filtered %>% 
+  group_by(group, season_id) %>% 
+  filter(n() > 1)
+```
+
+```{r}
+# How many individuals and dyads in that season?
+group_metrics_df %>% 
+  filter(group == "Noha", season_id == "dry_2024")
+
+# How many scans total?
+scans %>% 
+  filter(group == "Noha", season_id == "dry_2024") %>% 
+  summarise(n_scans = n_distinct(scan_id), n_individuals = n_distinct(idindividual1))
+```
+The squashed noha eigenvector centrality for dry_2024 is due to the fact that as there are only 264 scans spread across 64 individuals (median 3 scans), most dyads were never observed in proximity together, giving them an SRI of 0 or near-0 — and eigenvector centrality compounds this by giving low scores to individuals connected only to other low-scoring individuals, pushing almost everyone toward zero.
+
+```{r}
+write.csv(group_metrics_filtered, "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/FeedingSocialityProject/Results/group_metrics_outexp.csv")
+write.csv(individual_metrics_filtered, "/Users/alba/Library/Mobile Documents/com~apple~CloudDocs/Postdoc_UNIL/Vervet_projects/FeedingSocialityProject/Results/individual_metrics_outexp.csv")
+```
+
